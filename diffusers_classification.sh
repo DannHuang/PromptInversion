@@ -1,0 +1,11 @@
+accelerate launch --num_processes 1 --gpu_ids 1 _cls_token_optimize.py \
+    --output_dir /share/huangrenyuan/logs/ground_diffusion \
+    --pretrained_model_name_or_path /share/huangrenyuan/model_zoo/diffusion/stable-diffusion-xl-base-1.0 \
+    --train_batch_size 1 \
+    --gradient_checkpointing \
+    --class_token "<cls>" \
+    --mixed_precision no \
+    --learning_rate 1e-4 \
+    --seed 42
+    --validation_image "./assets/0.jpg" \
+    --validation_prompt "a rabbit, masterpiece, best quality, high quality"

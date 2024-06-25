@@ -87,6 +87,19 @@ logger = get_logger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pretrained_vae_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to an improved VAE to stabilize training. For more details check out: https://github.com/huggingface/diffusers/pull/4038.",
+    )
+    parser.add_argument(
         "--save_steps",
         type=int,
         default=500,
@@ -119,13 +132,6 @@ def parse_args():
         help="Number of class token embeddings to optimize.",
     )
     parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -139,7 +145,7 @@ def parse_args():
         help="Pretrained tokenizer name or path if not the same as model_name",
     )
     parser.add_argument(
-        "--train_data_dir", type=str, default=None, required=True, help="A folder containing the training data."
+        "--train_data_dir", type=str, default=None, required=False, help="A folder containing the training data."
     )
     parser.add_argument("--learnable_property", type=str, default="object", help="Choose between 'object' and 'style'")
     parser.add_argument("--repeats", type=int, default=100, help="How many times to repeat the training data.")
@@ -179,6 +185,18 @@ def parse_args():
         help="Whether or not to use CFG.",
     )
     parser.add_argument(
+        "--crops_coords_top_left_h",
+        type=int,
+        default=0,
+        help=("Coordinate for (the height) to be included in the crop coordinate embeddings needed by SDXL UNet."),
+    )
+    parser.add_argument(
+        "--crops_coords_top_left_w",
+        type=int,
+        default=0,
+        help=("Coordinate for (the height) to be included in the crop coordinate embeddings needed by SDXL UNet."),
+    )
+    parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
@@ -194,6 +212,12 @@ def parse_args():
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--guidance_rescale",
+        type=float,
+        default=0.0,
+        help="guidance rescale"
     )
     parser.add_argument(
         "--scale_lr",
@@ -341,14 +365,20 @@ def parse_args():
         action="store_true",
         help="If specified save the checkpoint not in `safetensors` format, but in original PyTorch format instead.",
     )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.train_data_dir is None:
-        raise ValueError("You must specify a train data directory.")
+    # if args.train_data_dir is None:
+    #     raise ValueError("You must specify a train data directory.")
 
     return args
 
@@ -369,27 +399,47 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
 def encode_prompt(prompt_batch, text_encoders, tokenizers):
     prompt_embeds_list = []
 
-    for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-        text_inputs = tokenizer(
+    with torch.no_grad():
+        text_inputs = tokenizers[0](
             prompt_batch,
             padding="max_length",
-            max_length=tokenizer.model_max_length,
+            max_length=tokenizers[0].model_max_length,
             truncation=True,
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids
-        # tokens = tokenizer.convert_ids_to_tokens(text_input_ids[-1])
+        # tokens = tokenizers[1].convert_ids_to_tokens(text_input_ids[-1])
         # print(tokens)
-        prompt_embeds = text_encoder(
-            text_input_ids.to(text_encoder.device),
+        prompt_embeds = text_encoders[0](
+            text_input_ids.to(text_encoders[0].device),
             output_hidden_states=True,
         )
 
         # We are only ALWAYS interested in the pooled output of the final text encoder
-        pooled_prompt_embeds = prompt_embeds[0]
+        # pooled_prompt_embeds = prompt_embeds[0]
         prompt_embeds = prompt_embeds.hidden_states[-2]
         bs_embed, seq_len, _ = prompt_embeds.shape
         prompt_embeds_list.append(prompt_embeds)
+
+    text_inputs = tokenizers[1](
+        prompt_batch,
+        padding="max_length",
+        max_length=tokenizers[1].model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    tokens = tokenizers[1].convert_ids_to_tokens(text_input_ids[-1])
+    prompt_embeds = text_encoders[1](
+        text_input_ids.to(text_encoders[1].device),
+        output_hidden_states=True,
+    )
+
+    # We are only ALWAYS interested in the pooled output of the final text encoder
+    pooled_prompt_embeds = prompt_embeds[0]
+    prompt_embeds = prompt_embeds.hidden_states[-2]
+    bs_embed, seq_len, _ = prompt_embeds.shape
+    prompt_embeds_list.append(prompt_embeds)
 
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
@@ -472,102 +522,6 @@ def prepare_ip_adapter_image_embeds(
 
     return image_embeds
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
-def prepare_extra_step_kwargs(self, generator, eta):
-    # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-    # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-    # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
-    # and should be between [0, 1]
-
-    accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
-    extra_step_kwargs = {}
-    if accepts_eta:
-        extra_step_kwargs["eta"] = eta
-
-    # check if the scheduler accepts generator
-    accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
-    if accepts_generator:
-        extra_step_kwargs["generator"] = generator
-    return extra_step_kwargs
-
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
-def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
-    shape = (
-        batch_size,
-        num_channels_latents,
-        int(height) // self.vae_scale_factor,
-        int(width) // self.vae_scale_factor,
-    )
-    if isinstance(generator, list) and len(generator) != batch_size:
-        raise ValueError(
-            f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-            f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-        )
-
-    if latents is None:
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    else:
-        latents = latents.to(device)
-
-    # scale the initial noise by the standard deviation required by the scheduler
-    latents = latents * self.scheduler.init_noise_sigma
-    return latents
-
-def _get_add_time_ids(
-    self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
-):
-    add_time_ids = list(original_size + crops_coords_top_left + target_size)
-
-    passed_add_embed_dim = (
-        self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
-    )
-    expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
-
-    if expected_add_embed_dim != passed_add_embed_dim:
-        raise ValueError(
-            f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
-        )
-
-    add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
-    return add_time_ids
-
-def upcast_vae(self):
-    dtype = self.vae.dtype
-    self.vae.to(dtype=torch.float32)
-    use_torch_2_0_or_xformers = isinstance(
-        self.vae.decoder.mid_block.attentions[0].processor,
-        (
-            AttnProcessor2_0,
-            XFormersAttnProcessor,
-            LoRAXFormersAttnProcessor,
-            LoRAAttnProcessor2_0,
-            FusedAttnProcessor2_0,
-        ),
-    )
-    # if xformers or torch_2_0 is used attention block does not need
-    # to be in float32 which can save lots of memory
-    if use_torch_2_0_or_xformers:
-        self.vae.post_quant_conv.to(dtype)
-        self.vae.decoder.conv_in.to(dtype)
-        self.vae.decoder.mid_block.to(dtype)
-
-# Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
-def get_guidance_scale_embedding(
-    self, w: torch.Tensor, embedding_dim: int = 512, dtype: torch.dtype = torch.float32
-) -> torch.FloatTensor:
-
-    assert len(w.shape) == 1
-    w = w * 1000.0
-
-    half_dim = embedding_dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
-    emb = w.to(dtype)[:, None] * emb[None, :]
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-    if embedding_dim % 2 == 1:  # zero pad
-        emb = torch.nn.functional.pad(emb, (0, 1))
-    assert emb.shape == (w.shape[0], embedding_dim)
-    return emb
 
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
@@ -682,7 +636,7 @@ def main():
     # cls_tokens += additional_tokens
 
     num_added_tokens_2 = tokenizer_2.add_tokens(cls_tokens)
-    if num_added_tokens_2 != args.num_vectors:
+    if num_added_tokens_2 != args.num_embeds:
         raise ValueError(
             f"The tokenizer already contains the token {args.class_token}. Please pass a different"
             " `placeholder_token` that is not already in the tokenizer."
@@ -701,7 +655,7 @@ def main():
     text_encoder_2.resize_token_embeddings(len(tokenizer_2))
 
     # Initialise the newly added class token with the embeddings of the initializer token
-    token_embeds = text_encoder.get_input_embeddings().weight.data
+    token_embeds = text_encoder_2.get_input_embeddings().weight.data
     with torch.no_grad():
         for token_id in cls_token_ids:
             token_embeds[token_id] = token_embeds[initializer_token_id].clone()
@@ -720,6 +674,7 @@ def main():
         # The dropout cannot be != 0 so it doesn't matter if we are in eval or train mode.
         unet.train()
         text_encoder.gradient_checkpointing_enable()
+        text_encoder_2.gradient_checkpointing_enable()
         unet.enable_gradient_checkpointing()
 
     if args.enable_xformers_memory_efficient_attention:
@@ -776,13 +731,26 @@ def main():
     #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     #     overrode_max_train_steps = True
 
-    def compute_embeddings(prompts, text_encoders, tokenizers, proportion_empty_prompts=0.0, is_train=True):
+    transform = transforms.Compose([
+        transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(args.resolution),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    @torch.no_grad()
+    def read_image(image_dir):
+        image_pt = transform(Image.open(image_dir).convert("RGB"))
+        return image_pt
+
+    def compute_embeddings(prompts, text_encoders, tokenizers):
         original_size = (args.resolution, args.resolution)
         target_size = (args.resolution, args.resolution)
         crops_coords_top_left = (args.crops_coords_top_left_h, args.crops_coords_top_left_w)
 
         prompt_embeds, pooled_prompt_embeds = encode_prompt(
-            prompts, text_encoders, tokenizers, proportion_empty_prompts, is_train
+            prompts, text_encoders, tokenizers
         )
         add_text_embeds = pooled_prompt_embeds
 
@@ -810,7 +778,6 @@ def main():
         compute_embeddings,
         text_encoders=[text_encoder, text_encoder_2],
         tokenizers=[tokenizer, tokenizer_2],
-        proportion_empty_prompts=0,
     )
 
     lr_scheduler = get_scheduler(
@@ -853,23 +820,35 @@ def main():
     # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     # logger.info(f"  Total batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
 
-    prompt = "a photo of <cls>"
+    with torch.no_grad():
+        prompt_embeds, add_conds = compute_embeddings_fn(
+            ["a photo of <cls>", "a photo of rabbit"],
+        )
+        emb_s, emb_l = torch.split(prompt_embeds, [768, 1280], dim=-1)
+        print((emb_l[0][4]-emb_l[1][4]).pow(2).mean().sqrt())
+        # print((pooled_prompt_embd[0]-pooled_prompt_embd[1]).pow(2).mean().sqrt())
 
-    (
-        prompt_embeds,
-        pooled_prompt_embeds,
-    ) = encode_prompt(
-        prompt,
-        [text_encoder, text_encoder_2],
-        [tokenizer, tokenizer_2],
-    )
-    print((prompt_embeds[0][5]-prompt_embeds[1][5]).pow(2).mean().sqrt())
+    image = read_image("examples/0.jpg").unsqueeze(0)
+    # Convert images to latent space
+    image = image.to(accelerator.device, dtype=vae.dtype)
+
+    # Process text inputs.
+    # prompt_embeds_input, added_conditions = compute_embeddings_fn(prompt)
+
+    # Move inputs to latent space.
+    latent = convert_to_latent(image)
+    if args.pretrained_vae_model_name_or_path is None:
+        latent = latent.to(weight_dtype)
+    bsz = latent.shape[0]
+    prompt = ["a photo of <cls>",]
+    prompt_embeds, add_conds = compute_embeddings_fn(prompt)
 
     # Cache original embedding for reference.
     orig_embeds_params = accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight.data.clone()
 
     # 4. Prepare timesteps
     timesteps = noise_scheduler.timesteps
+    curve = []
     # progress_bar = tqdm(
     #     range(0, args.max_train_steps),
     #     initial=0,
@@ -881,21 +860,10 @@ def main():
     # with self.progress_bar(total=num_inference_steps) as progress_bar:
     for i, t in enumerate(reversed(timesteps)):
 
-        # Convert images to latent space
-        image = image.to(dtype=vae.dtype)
-
-        # Process text inputs.
-        prompt_embeds_input, added_conditions = compute_embeddings_fn(prompt)
-
-        # Move inputs to latent space.
-        model_input = convert_to_latent(image)
-        if args.pretrained_vae_model_name_or_path is None:
-            model_input = model_input.to(weight_dtype)
         # Sample noise that we'll add to the latents.
-        noise = torch.randn_like(model_input)
-        bsz = model_input.shape[0]
+        noise = torch.randn_like(latent)
         timesteps = torch.tensor([t]*bsz, dtype=torch.int64, device=accelerator.device)
-        noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
+        noisy_model_input = noise_scheduler.add_noise(latent, noise, timesteps)
 
         # expand the latents if we are doing classifier free guidance
         latent_model_input = torch.cat([noisy_model_input] * 2) if args.do_CFG else noisy_model_input
@@ -903,8 +871,8 @@ def main():
         noise_pred = unet(
             latent_model_input,
             t,
-            encoder_hidden_states=prompt_embeds_input,                # [B, 77, 2048]
-            added_cond_kwargs=added_conditions,                # {[B, 1280], [B, 6]}
+            encoder_hidden_states=prompt_embeds,                # [B, 77, 2048]
+            added_cond_kwargs=add_conds,                # {[B, 1280], [B, 6]}
             return_dict=False,
         )[0]
 
@@ -913,34 +881,34 @@ def main():
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        if args.do_classifier_free_guidance and args.guidance_rescale > 0.0:
+        if args.do_CFG and args.guidance_rescale > 0.0:
             # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=args.guidance_rescale)
 
         # Get the target for loss depending on the prediction type
         if noise_scheduler.config.prediction_type == "epsilon":
             target = noise
         elif noise_scheduler.config.prediction_type == "v_prediction":
-            target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+            target = noise_scheduler.get_velocity(latent, noise, timesteps)
         else:
             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
         loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
-        accelerator.backward(loss)
+        accelerator.backward(loss, retain_graph=True)
 
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
 
         # Let's make sure we don't update any embedding weights besides the newly added token
-        index_no_updates = torch.ones((len(tokenizer),), dtype=torch.bool)
-        index_no_updates[min(placeholder_token_ids) : max(placeholder_token_ids) + 1] = False
+        index_no_updates = torch.ones((len(tokenizer_2),), dtype=torch.bool)
+        index_no_updates[min(cls_token_ids) : max(cls_token_ids) + 1] = False
 
-        with torch.no_grad():
-            accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
-                index_no_updates
-            ] = orig_embeds_params[index_no_updates]
+        # with torch.no_grad():
+        #     accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight[
+        #         index_no_updates
+        #     ] = orig_embeds_params[index_no_updates]
 
         # compute the previous noisy sample x_t -> x_t-1
         # latents_dtype = latents.dtype
@@ -949,6 +917,16 @@ def main():
         #     if torch.backends.mps.is_available():
         #         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
         #         latents = latents.to(latents_dtype)
+
+        with torch.no_grad():
+            p_embeds, addition_conds = compute_embeddings_fn(
+                ["a photo of <cls>", "a photo of rabbit"],
+            )
+            emb_s, emb_l = torch.split(p_embeds, [768, 1280], dim=-1)
+            dis = (emb_l[0][4]-emb_l[1][4]).pow(2).mean().sqrt()
+            print(dis.item())
+            curve.append(dis.item())
+            # print((pooled_prompt_embd[0]-pooled_prompt_embd[1]).pow(2).mean().sqrt())
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 import argparse
 import logging
 import math
+import time
 import functools
 import os
 import random
@@ -24,28 +25,36 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
 import PIL
-import safetensors
 import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from huggingface_hub import create_repo, upload_folder
 
 # TODO: remove and import from diffusers.utils when the new version of diffusers is released
 from packaging import version
 from PIL import Image
-from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
+import dnnlib
+import misc
 from transformers import (
     AutoTokenizer,
     PretrainedConfig,
     CLIPImageProcessor, CLIPVisionModelWithProjection,
     AutoImageProcessor, AutoModel
+)
+
+from utils import (
+    attn_maps,
+    cross_attn_init,
+    register_cross_attention_hook,
+    set_layer_with_name_and_path,
+    preprocess,
+    visualize_and_save_attn_map,
+    init_attn_maps_cache
 )
 
 import diffusers
@@ -56,12 +65,8 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-
-if is_wandb_available():
-    import wandb
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -79,9 +84,29 @@ else:
         "lanczos": PIL.Image.LANCZOS,
         "nearest": PIL.Image.NEAREST,
     }
+from imagenet_vocabulary import ImageNet_vocabulary
 # ------------------------------------------------------------------------------
 
 logger = get_logger(__name__)
+
+sub_vocabulary = {
+    0: 'person',
+    1: 'cat',
+    2: 'dog',
+    3: 'rabbit',
+    4: 'car',
+    5: 'plane',
+    6: 'tree',
+    7: 'flower',
+    8: 'building',
+    9: 'house',
+    10: 'table',
+    11: 'chair',
+    12: 'food',
+    13: 'fruit',
+    14: 'vegetable',
+    15: 'animal'
+}
 
 
 def parse_args():
@@ -106,7 +131,17 @@ def parse_args():
         help="Save learned_embeds.bin every X updates steps.",
     )
     parser.add_argument(
-        "--save_as_full_pipeline",
+        "--test_rabbit",
+        action="store_true",
+        help="Save the complete stable diffusion pipeline.",
+    )
+    parser.add_argument(
+        "--attn_map",
+        action="store_true",
+        help="Save the complete stable diffusion pipeline.",
+    )
+    parser.add_argument(
+        "--global_emb",
         action="store_true",
         help="Save the complete stable diffusion pipeline.",
     )
@@ -130,6 +165,13 @@ def parse_args():
         default=1,
         required=False,
         help="Number of class token embeddings to optimize.",
+    )
+    parser.add_argument(
+        "--test_num",
+        type=int,
+        default=1000,
+        required=False,
+        help="Number of test images to run.",
     )
     parser.add_argument(
         "--revision",
@@ -212,12 +254,6 @@ def parse_args():
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument(
-        "--guidance_rescale",
-        type=float,
-        default=0.0,
-        help="guidance rescale"
     )
     parser.add_argument(
         "--scale_lr",
@@ -382,23 +418,11 @@ def parse_args():
 
     return args
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
-def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
-    """
-    Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
-    Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
-    """
-    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
-    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
-    # rescale the results from guidance (fixes overexposure)
-    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
-    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
-    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
-    return noise_cfg
 
-def encode_prompt(prompt_batch, text_encoders, tokenizers):
+def encode_prompt(prompt_batch, text_encoders, tokenizers, get_cls_idx=False):
     prompt_embeds_list = []
 
+    # ViT-L encode
     with torch.no_grad():
         text_inputs = tokenizers[0](
             prompt_batch,
@@ -408,8 +432,6 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers):
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids
-        # tokens = tokenizers[1].convert_ids_to_tokens(text_input_ids[-1])
-        # print(tokens)
         prompt_embeds = text_encoders[0](
             text_input_ids.to(text_encoders[0].device),
             output_hidden_states=True,
@@ -421,6 +443,7 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers):
         bs_embed, seq_len, _ = prompt_embeds.shape
         prompt_embeds_list.append(prompt_embeds)
 
+    # ViT-bigG encode
     text_inputs = tokenizers[1](
         prompt_batch,
         padding="max_length",
@@ -429,7 +452,11 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers):
         return_tensors="pt",
     )
     text_input_ids = text_inputs.input_ids
-    tokens = tokenizers[1].convert_ids_to_tokens(text_input_ids[-1])
+    if get_cls_idx:
+        tokens = tokenizers[1].convert_ids_to_tokens(text_input_ids[0])
+        for i, token in enumerate(tokens):
+            if "<cls>" in token:
+                return i
     prompt_embeds = text_encoders[1](
         text_input_ids.to(text_encoders[1].device),
         output_hidden_states=True,
@@ -445,8 +472,9 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers):
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return prompt_embeds, pooled_prompt_embeds
 
+
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.encode_image
-def encode_image(self, image, device, num_images_per_prompt, output_hidden_states=None):
+def encode_image(image, device, num_images_per_prompt, output_hidden_states=None):
     dtype = next(self.image_encoder.parameters()).dtype
 
     if not isinstance(image, torch.Tensor):
@@ -470,57 +498,54 @@ def encode_image(self, image, device, num_images_per_prompt, output_hidden_state
 
         return image_embeds, uncond_image_embeds
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_ip_adapter_image_embeds
-def prepare_ip_adapter_image_embeds(
-    self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
-):
-    if ip_adapter_image_embeds is None:
-        if not isinstance(ip_adapter_image, list):
-            ip_adapter_image = [ip_adapter_image]
 
-        if len(ip_adapter_image) != len(self.unet.encoder_hid_proj.image_projection_layers):
-            raise ValueError(
-                f"`ip_adapter_image` must have same length as the number of IP Adapters. Got {len(ip_adapter_image)} images and {len(self.unet.encoder_hid_proj.image_projection_layers)} IP Adapters."
-            )
+@torch.no_grad()
+def compute_vocabulary_embedding(cls_prompt, compute_embeddings_fn, cls_idx=None, sub_vocab=False):
+    embedding_dict = {}
+    vocab = sub_vocabulary if sub_vocab else ImageNet_vocabulary
+    for idx, class_phrase in vocab.items():
+        prompt = [cls_prompt.replace("<cls>", class_phrase)]
+        prompt_embedding, addtional_conditions = compute_embeddings_fn(prompt)
+        if cls_idx:
+            emb_l, emb_bigG = torch.split(prompt_embedding, [768, 1280], dim=-1)
+            embedding = emb_bigG[0][cls_idx]
+        else:
+            embedding = addtional_conditions["text_embeds"][0]
+        embedding_dict[idx] = embedding
+    return embedding_dict
 
-        image_embeds = []
-        for single_ip_adapter_image, image_proj_layer in zip(
-            ip_adapter_image, self.unet.encoder_hid_proj.image_projection_layers
-        ):
-            output_hidden_state = not isinstance(image_proj_layer, ImageProjection)
-            single_image_embeds, single_negative_image_embeds = self.encode_image(
-                single_ip_adapter_image, device, 1, output_hidden_state
-            )
-            single_image_embeds = torch.stack([single_image_embeds] * num_images_per_prompt, dim=0)
-            single_negative_image_embeds = torch.stack(
-                [single_negative_image_embeds] * num_images_per_prompt, dim=0
-            )
 
-            if do_classifier_free_guidance:
-                single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
-                single_image_embeds = single_image_embeds.to(device)
+@torch.no_grad()
+def do_classification(cls_prompt, compute_embeddings_fn, embedding_dict, cls_idx=None, sub_vocab=False):
+    min_dis = 1.0
+    pred_cls = -1
+    cls_scores = []
+    prompt_embedding, addtional_conditions = compute_embeddings_fn([cls_prompt])
+    vocab = sub_vocabulary if sub_vocab else ImageNet_vocabulary
 
-            image_embeds.append(single_image_embeds)
+    # Get embedding
+    if cls_idx:
+        emb_l, emb_bigG = torch.split(prompt_embedding, [768, 1280], dim=-1)
+        embedding = emb_bigG[0][cls_idx]
     else:
-        repeat_dims = [1]
-        image_embeds = []
-        for single_image_embeds in ip_adapter_image_embeds:
-            if do_classifier_free_guidance:
-                single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
-                single_image_embeds = single_image_embeds.repeat(
-                    num_images_per_prompt, *(repeat_dims * len(single_image_embeds.shape[1:]))
-                )
-                single_negative_image_embeds = single_negative_image_embeds.repeat(
-                    num_images_per_prompt, *(repeat_dims * len(single_negative_image_embeds.shape[1:]))
-                )
-                single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
-            else:
-                single_image_embeds = single_image_embeds.repeat(
-                    num_images_per_prompt, *(repeat_dims * len(single_image_embeds.shape[1:]))
-                )
-            image_embeds.append(single_image_embeds)
+        embedding = addtional_conditions["text_embeds"][0]
 
-    return image_embeds
+    # Calculate distances
+    for idx, class_phrase in vocab.items():
+        dis = (embedding - embedding_dict[idx]).pow(2).mean().sqrt()
+        cls_scores.append(dis.item())
+        # print(class_phrase, ": ", cls_scores[idx])
+    if sub_vocab:
+        return
+    else:
+        indexed_list = list(enumerate(cls_scores))
+        sorted_indexed_list = sorted(indexed_list, key=lambda x: x[1])
+        sorted_elements = [element for index, element in sorted_indexed_list]
+        # print(cls_scores)
+        original_indices = [index for index, element in sorted_indexed_list]
+        # print(original_indices)
+        cls_scores_var = np.var(cls_scores)
+        return original_indices[0], cls_scores_var
 
 
 def import_model_class_from_model_name_or_path(
@@ -542,9 +567,11 @@ def import_model_class_from_model_name_or_path(
     else:
         raise ValueError(f"{model_class} is not supported.")
 
+
 def main():
 
     args = parse_args()
+
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
@@ -595,7 +622,7 @@ def main():
         use_fast=False,
     )
 
-    # Text encoder and image encoder.
+    # Text encoder.
     text_encoder_cls_one = import_model_class_from_model_name_or_path(
         args.pretrained_model_name_or_path, args.revision
     )
@@ -621,8 +648,11 @@ def main():
         variant=args.variant,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-    )
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        variant=args.variant
+    )        
 
     # Insert tokens to be optimized into tokenizer.
     cls_tokens = [args.class_token]
@@ -659,6 +689,9 @@ def main():
     with torch.no_grad():
         for token_id in cls_token_ids:
             token_embeds[token_id] = token_embeds[initializer_token_id].clone()
+    prompt = f"a photo of {args.class_token}"
+    with torch.no_grad():
+        cls_idx = encode_prompt(prompt, [text_encoder, text_encoder_2], [tokenizer, tokenizer_2], get_cls_idx=True)
 
     # Freeze vae and unet
     vae.requires_grad_(False)
@@ -710,27 +743,6 @@ def main():
     )
 
     # Dataset and DataLoaders creation:
-    # train_dataset = TextualInversionDataset(
-    #     data_root=args.train_data_dir,
-    #     tokenizer=tokenizer,
-    #     size=args.resolution,
-    #     placeholder_token=(" ".join(tokenizer.convert_ids_to_tokens(placeholder_token_ids))),
-    #     repeats=args.repeats,
-    #     learnable_property=args.learnable_property,
-    #     center_crop=args.center_crop,
-    #     set="train",
-    # )
-    # train_dataloader = torch.utils.data.DataLoader(
-    #     train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
-    # )
-
-    # Scheduler and math around the number of training steps.
-    # overrode_max_train_steps = False
-    # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    # if args.max_train_steps is None:
-    #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    #     overrode_max_train_steps = True
-
     transform = transforms.Compose([
         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(args.resolution),
@@ -738,6 +750,18 @@ def main():
         transforms.Normalize([0.5], [0.5]),
         ]
     )
+    dataset_kwargs = dnnlib.EasyDict(class_name='dataset.ImageFolderDataset', path=args.train_data_dir, use_labels=True)
+    dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
+    if not dataset_obj.has_labels:
+        raise ValueError('--cond=True, but no labels found in the dataset')
+    dataset_sampler = misc.InfiniteSampler(
+        dataset=dataset_obj,
+        rank=accelerator.process_index,
+        num_replicas=accelerator.num_processes,
+        seed=args.seed, start_idx=0
+    )
+    data_loader_kwargs = dict(class_name='torch.utils.data.DataLoader', pin_memory=True, num_workers=2, prefetch_factor=2)
+    dataset_iterator = iter(dnnlib.util.construct_class_by_name(dataset=dataset_obj, sampler=dataset_sampler, batch_size=1, **data_loader_kwargs))
 
     @torch.no_grad()
     def read_image(image_dir):
@@ -805,128 +829,158 @@ def main():
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-
-    # # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    # num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    # if overrode_max_train_steps:
-    #     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # # Afterwards we recalculate our number of training epochs
-    # args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    text_encoder_2.to(accelerator.device, dtype=weight_dtype)
 
     # GO!
     # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    # logger.info("***** Running *****")
-    # logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info("***** Running *****")
+    logger.info(f"  Num examples = {len(dataset_obj)}")
     # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     # logger.info(f"  Total batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-
-    with torch.no_grad():
-        prompt_embeds, add_conds = compute_embeddings_fn(
-            ["a photo of <cls>", "a photo of rabbit"],
-        )
-        emb_s, emb_l = torch.split(prompt_embeds, [768, 1280], dim=-1)
-        print((emb_l[0][4]-emb_l[1][4]).pow(2).mean().sqrt())
-        # print((pooled_prompt_embd[0]-pooled_prompt_embd[1]).pow(2).mean().sqrt())
-
-    image = read_image("examples/0.jpg").unsqueeze(0)
-    # Convert images to latent space
-    image = image.to(accelerator.device, dtype=vae.dtype)
-
-    # Process text inputs.
-    # prompt_embeds_input, added_conditions = compute_embeddings_fn(prompt)
-
-    # Move inputs to latent space.
-    latent = convert_to_latent(image)
-    if args.pretrained_vae_model_name_or_path is None:
-        latent = latent.to(weight_dtype)
-    bsz = latent.shape[0]
-    prompt = ["a photo of <cls>",]
-    prompt_embeds, add_conds = compute_embeddings_fn(prompt)
-
-    # Cache original embedding for reference.
-    orig_embeds_params = accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight.data.clone()
-
-    # 4. Prepare timesteps
-    timesteps = noise_scheduler.timesteps
-    curve = []
+    test_num = min(args.test_num, len(dataset_obj))
+    num_correct = 0
     # progress_bar = tqdm(
-    #     range(0, args.max_train_steps),
+    #     range(0, len(test_num)),
     #     initial=0,
     #     desc="Steps",
     #     # Only show the progress bar once on each machine.
     #     disable=not accelerator.is_local_main_process,
     # )
 
-    # with self.progress_bar(total=num_inference_steps) as progress_bar:
-    for i, t in enumerate(reversed(timesteps)):
+    # Cache original embedding for reference.
+    if args.global_emb:
+        embedding_dict = compute_vocabulary_embedding(prompt, compute_embeddings_fn, sub_vocab=args.test_rabbit)
+        do_classification(prompt, compute_embeddings_fn, embedding_dict, sub_vocab=args.test_rabbit)
+    else:
+        embedding_dict = compute_vocabulary_embedding(prompt, compute_embeddings_fn, cls_idx=cls_idx, sub_vocab=args.test_rabbit)
+        do_classification(prompt, compute_embeddings_fn, embedding_dict, cls_idx=cls_idx, sub_vocab=args.test_rabbit)
+    orig_embeds_params = accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight.data.clone()
 
-        # Sample noise that we'll add to the latents.
-        noise = torch.randn_like(latent)
-        timesteps = torch.tensor([t]*bsz, dtype=torch.int64, device=accelerator.device)
-        noisy_model_input = noise_scheduler.add_noise(latent, noise, timesteps)
+    for i, (image, label) in enumerate(dataset_iterator):
+        if i == test_num:
+            return
+        numpy_array = image.numpy()
+        numpy_array = numpy_array.squeeze(0).astype(np.uint8)
+        numpy_array = np.transpose(numpy_array, (1, 2, 0))
+        pil_image = Image.fromarray(numpy_array)
+        pil_image.save('imagenet_image.png')
+        # print(f"class phrase: {ImageNet_vocabulary[np.argmax(label).item()]}")
+        image = (image.to(dtype=torch.float32) - 127.5) / 127.5
+        if args.test_rabbit:
+            # Test with JourneyDB rabbit.
+            image = read_image("examples/0.jpg").unsqueeze(0)
+        image = image.to(accelerator.device, dtype=vae.dtype)
 
-        # expand the latents if we are doing classifier free guidance
-        latent_model_input = torch.cat([noisy_model_input] * 2) if args.do_CFG else noisy_model_input
+        # Move inputs to latent space.
+        latent = convert_to_latent(image)
+        if args.pretrained_vae_model_name_or_path is None:
+            latent = latent.to(weight_dtype)
+        bsz = latent.shape[0]
 
-        noise_pred = unet(
-            latent_model_input,
-            t,
-            encoder_hidden_states=prompt_embeds,                # [B, 77, 2048]
-            added_cond_kwargs=add_conds,                # {[B, 1280], [B, 6]}
-            return_dict=False,
-        )[0]
+        # 4. Prepare timesteps
+        timesteps = reversed(noise_scheduler.timesteps)
+        curve = []
+        timesteps = [100] * 300
 
-        # perform guidance
-        if args.do_CFG:
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
+        # with self.progress_bar(total=num_inference_steps) as progress_bar:
+        tic = time.time()
+        for id_t, t in enumerate(timesteps):
 
-        if args.do_CFG and args.guidance_rescale > 0.0:
-            # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=args.guidance_rescale)
+            if id_t == len(timesteps) - 1 and args.attn_map:
+                cross_attn_init()
+                unet = set_layer_with_name_and_path(unet)
+                unet = register_cross_attention_hook(unet)
+            # Sample noise that we'll add to the latents.
+            noise = torch.randn_like(latent)
+            ts = torch.tensor([t]*bsz, dtype=torch.int64, device=accelerator.device)
+            noisy_model_input = noise_scheduler.add_noise(latent, noise, ts)
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([noisy_model_input] * 2) if args.do_CFG else noisy_model_input
 
-        # Get the target for loss depending on the prediction type
-        if noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif noise_scheduler.config.prediction_type == "v_prediction":
-            target = noise_scheduler.get_velocity(latent, noise, timesteps)
+            prompt_embeds, add_conds = compute_embeddings_fn([prompt])
+
+            noise_pred = unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,                # [B, 77, 2048]
+                added_cond_kwargs=add_conds,                # {[B, 1280], [B, 6]}
+                return_dict=False,
+            )[0]
+
+            # perform guidance
+            if args.do_CFG:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # Get the target for loss depending on the prediction type
+            if noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif noise_scheduler.config.prediction_type == "v_prediction":
+                target = noise_scheduler.get_velocity(latent, noise, ts)
+            else:
+                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+            accelerator.backward(loss, retain_graph=True)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+            # Make sure we don't update any embedding weights besides the newly added token
+            index_no_updates = torch.ones((len(tokenizer_2),), dtype=torch.bool)
+            index_no_updates[min(cls_token_ids) : max(cls_token_ids) + 1] = False
+            with torch.no_grad():
+                accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight[
+                    index_no_updates
+                ] = orig_embeds_params[index_no_updates]
+
+                # Loss curve
+                if args.test_rabbit:
+                    test_prompt_embedding, test_addtional_conditions = compute_embeddings_fn(
+                        [prompt, prompt.replace("<cls>", 'rabbit')]
+                    )
+                    if args.global_emb:
+                        test_error = (test_addtional_conditions["text_embeds"][0] - test_addtional_conditions["text_embeds"][1]).pow(2).mean().sqrt()
+                    else:
+                        emb_L, emb_bigG = torch.split(test_prompt_embedding, [768, 1280], dim=-1)
+                        test_error = (emb_bigG[0][cls_idx] - emb_bigG[1][cls_idx]).pow(2).mean().sqrt()
+                    curve.append(test_error.item())
+                    # if id_t == 0 and args.attn_map:
+                    #     attn_map = preprocess(max_height=args.resolution, max_width=args.resolution,)
+                    #     visualize_and_save_attn_map(attn_map, tokenizer_2, [prompt], postfix=f"before")
+
+            # compute the previous noisy sample x_t -> x_t-1
+            # latents_dtype = latents.dtype
+            # latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+            # if latents.dtype != latents_dtype:
+            #     if torch.backends.mps.is_available():
+            #         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+            #         latents = latents.to(latents_dtype)
+
+        toc = time.time()
+        # print("Time: ", toc-tic)
+
+        if args.test_rabbit:
+            print(curve)
+            if args.global_emb:
+                do_classification(prompt, compute_embeddings_fn, embedding_dict, sub_vocab=args.test_rabbit)
+            else:
+                do_classification(prompt, compute_embeddings_fn, embedding_dict, cls_idx=cls_idx, sub_vocab=args.test_rabbit)
+            if args.attn_map:
+                # Extract attention map
+                attn_map = preprocess(max_height=args.resolution, max_width=args.resolution,)
+                visualize_and_save_attn_map(attn_map, tokenizer_2, [prompt], postfix=f"after")
+            return
         else:
-            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-        loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-
-        accelerator.backward(loss, retain_graph=True)
-
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad()
-
-        # Let's make sure we don't update any embedding weights besides the newly added token
-        index_no_updates = torch.ones((len(tokenizer_2),), dtype=torch.bool)
-        index_no_updates[min(cls_token_ids) : max(cls_token_ids) + 1] = False
-
-        # with torch.no_grad():
-        #     accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight[
-        #         index_no_updates
-        #     ] = orig_embeds_params[index_no_updates]
-
-        # compute the previous noisy sample x_t -> x_t-1
-        # latents_dtype = latents.dtype
-        # latents = noise_scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-        # if latents.dtype != latents_dtype:
-        #     if torch.backends.mps.is_available():
-        #         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-        #         latents = latents.to(latents_dtype)
-
-        with torch.no_grad():
-            p_embeds, addition_conds = compute_embeddings_fn(
-                ["a photo of <cls>", "a photo of rabbit"],
-            )
-            emb_s, emb_l = torch.split(p_embeds, [768, 1280], dim=-1)
-            dis = (emb_l[0][4]-emb_l[1][4]).pow(2).mean().sqrt()
-            print(dis.item())
-            curve.append(dis.item())
-            # print((pooled_prompt_embd[0]-pooled_prompt_embd[1]).pow(2).mean().sqrt())
+            if args.global_emb:
+                pred_cls, score_var = do_classification(prompt, compute_embeddings_fn, embedding_dict, sub_vocab=args.test_rabbit)
+            else:
+                pred_cls, score_var = do_classification(prompt, compute_embeddings_fn, embedding_dict, cls_idx=cls_idx, sub_vocab=args.test_rabbit)
+            if pred_cls == np.argmax(label).item():
+                num_correct += 1
+            # print(f"Pred cls: {pred_cls} | {ImageNet_vocabulary[pred_cls]}")
+            # print(f"Ground truth: {np.argmax(label).item()} | {ImageNet_vocabulary[np.argmax(label).item()]}")
+            # print(f"acc: {num_correct}/{i+1}", score_var)
+            print(score_var, end=", ")
 
 
 if __name__ == "__main__":

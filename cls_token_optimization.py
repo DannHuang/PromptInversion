@@ -102,10 +102,10 @@ sub_vocabulary = {
     9: 'house',
     10: 'table',
     11: 'chair',
-    12: 'food',
+    12: 'penguins',
     13: 'fruit',
     14: 'vegetable',
-    15: 'animal'
+    15: 'kangaroo'
 }
 
 
@@ -125,10 +125,10 @@ def parse_args():
         help="Path to an improved VAE to stabilize training. For more details check out: https://github.com/huggingface/diffusers/pull/4038.",
     )
     parser.add_argument(
-        "--save_steps",
+        "--test_timestep",
         type=int,
-        default=500,
-        help="Save learned_embeds.bin every X updates steps.",
+        default=100,
+        help="Do inference on which timestep.",
     )
     parser.add_argument(
         "--test_rabbit",
@@ -349,6 +349,12 @@ def parse_args():
         help="Number of images that should be generated during validation with `validation_prompt`.",
     )
     parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=5.0,
+        help="CFG scale",
+    )
+    parser.add_argument(
         "--validation_steps",
         type=int,
         default=100,
@@ -534,7 +540,7 @@ def do_classification(cls_prompt, compute_embeddings_fn, embedding_dict, cls_idx
     for idx, class_phrase in vocab.items():
         dis = (embedding - embedding_dict[idx]).pow(2).mean().sqrt()
         cls_scores.append(dis.item())
-        # print(class_phrase, ": ", cls_scores[idx])
+        print(class_phrase, ": ", cls_scores[idx])
     if sub_vocab:
         return
     else:
@@ -580,10 +586,6 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
-
-    if args.report_to == "wandb":
-        if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -672,8 +674,8 @@ def main():
             " `placeholder_token` that is not already in the tokenizer."
         )
 
-    # Convert the initializer_token, placeholder_token to ids
-    # Directly retrive initializer token as it is in the vocabulary.
+    # Convert the initializer_token, placeholder_token to ids:
+    # Look-up initializer token in the vocabulary.
     cls_token_ids = tokenizer_2.convert_tokens_to_ids(cls_tokens)
     token_ids = tokenizer_2.encode(args.initializer_token, add_special_tokens=False)
     # Check if initializer_token is a single token or a sequence of tokens
@@ -689,9 +691,11 @@ def main():
     with torch.no_grad():
         for token_id in cls_token_ids:
             token_embeds[token_id] = token_embeds[initializer_token_id].clone()
-    prompt = f"a photo of {args.class_token}"
+    prompt = f"A group of {args.class_token} standing on an icy shore, with snowy mountains and a clear blue sky in the background, some {args.class_token} diving into the water."
+    # prompt = f"a photo of {args.class_token}"
     with torch.no_grad():
         cls_idx = encode_prompt(prompt, [text_encoder, text_encoder_2], [tokenizer, tokenizer_2], get_cls_idx=True)
+        print(f"<cls> token at {cls_idx}")
 
     # Freeze vae and unet
     vae.requires_grad_(False)
@@ -750,18 +754,6 @@ def main():
         transforms.Normalize([0.5], [0.5]),
         ]
     )
-    dataset_kwargs = dnnlib.EasyDict(class_name='dataset.ImageFolderDataset', path=args.train_data_dir, use_labels=True)
-    dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
-    if not dataset_obj.has_labels:
-        raise ValueError('--cond=True, but no labels found in the dataset')
-    dataset_sampler = misc.InfiniteSampler(
-        dataset=dataset_obj,
-        rank=accelerator.process_index,
-        num_replicas=accelerator.num_processes,
-        seed=args.seed, start_idx=0
-    )
-    data_loader_kwargs = dict(class_name='torch.utils.data.DataLoader', pin_memory=True, num_workers=2, prefetch_factor=2)
-    dataset_iterator = iter(dnnlib.util.construct_class_by_name(dataset=dataset_obj, sampler=dataset_sampler, batch_size=1, **data_loader_kwargs))
 
     @torch.no_grad()
     def read_image(image_dir):
@@ -834,10 +826,9 @@ def main():
     # GO!
     # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     logger.info("***** Running *****")
-    logger.info(f"  Num examples = {len(dataset_obj)}")
-    # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    # logger.info(f"  Total batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    test_num = min(args.test_num, len(dataset_obj))
+    # logger.info(f"  Num examples = {len(dataset_obj)}")
+
+    test_num = args.test_num
     num_correct = 0
     # progress_bar = tqdm(
     #     range(0, len(test_num)),
@@ -855,20 +846,24 @@ def main():
         embedding_dict = compute_vocabulary_embedding(prompt, compute_embeddings_fn, cls_idx=cls_idx, sub_vocab=args.test_rabbit)
         do_classification(prompt, compute_embeddings_fn, embedding_dict, cls_idx=cls_idx, sub_vocab=args.test_rabbit)
     orig_embeds_params = accelerator.unwrap_model(text_encoder_2).get_input_embeddings().weight.data.clone()
+    with torch.no_grad():
+        negative_prompt_embeds, negative_add_conds = compute_embeddings_fn([""])
 
-    for i, (image, label) in enumerate(dataset_iterator):
+    # for i, (image, label) in enumerate(dataset_iterator):
+    for i in range(10):
         if i == test_num:
             return
-        numpy_array = image.numpy()
-        numpy_array = numpy_array.squeeze(0).astype(np.uint8)
-        numpy_array = np.transpose(numpy_array, (1, 2, 0))
-        pil_image = Image.fromarray(numpy_array)
-        pil_image.save('imagenet_image.png')
-        # print(f"class phrase: {ImageNet_vocabulary[np.argmax(label).item()]}")
-        image = (image.to(dtype=torch.float32) - 127.5) / 127.5
         if args.test_rabbit:
             # Test with JourneyDB rabbit.
-            image = read_image("examples/0.jpg").unsqueeze(0)
+            image = read_image("test.png").unsqueeze(0)
+        else:
+            numpy_array = image.numpy()
+            numpy_array = numpy_array.squeeze(0).astype(np.uint8)
+            numpy_array = np.transpose(numpy_array, (1, 2, 0))
+            pil_image = Image.fromarray(numpy_array)
+            pil_image.save('imagenet_image.png')
+            print(f"class phrase: {ImageNet_vocabulary[np.argmax(label).item()]}")
+            image = (image.to(dtype=torch.float32) - 127.5) / 127.5
         image = image.to(accelerator.device, dtype=vae.dtype)
 
         # Move inputs to latent space.
@@ -880,24 +875,39 @@ def main():
         # 4. Prepare timesteps
         timesteps = reversed(noise_scheduler.timesteps)
         curve = []
-        timesteps = [100] * 300
+        timesteps = [args.test_timestep] * 200
 
         # with self.progress_bar(total=num_inference_steps) as progress_bar:
         tic = time.time()
         for id_t, t in enumerate(timesteps):
 
-            if id_t == len(timesteps) - 1 and args.attn_map:
-                cross_attn_init()
-                unet = set_layer_with_name_and_path(unet)
-                unet = register_cross_attention_hook(unet)
+            with torch.no_grad():
+                if args.test_rabbit:
+                    test_prompt_embedding, test_addtional_conditions = compute_embeddings_fn(
+                        [prompt, prompt.replace("<cls>", 'penguins')]
+                    )
+                    if args.global_emb:
+                        test_error = (test_addtional_conditions["text_embeds"][0] - test_addtional_conditions["text_embeds"][1]).pow(2).mean().sqrt()
+                    else:
+                        emb_L, emb_bigG = torch.split(test_prompt_embedding, [768, 1280], dim=-1)
+                        test_error = (emb_bigG[0][cls_idx] - emb_bigG[1][cls_idx]).pow(2).mean().sqrt()
+                    curve.append(test_error.item())
+
             # Sample noise that we'll add to the latents.
             noise = torch.randn_like(latent)
             ts = torch.tensor([t]*bsz, dtype=torch.int64, device=accelerator.device)
             noisy_model_input = noise_scheduler.add_noise(latent, noise, ts)
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([noisy_model_input] * 2) if args.do_CFG else noisy_model_input
 
-            prompt_embeds, add_conds = compute_embeddings_fn([prompt])
+            if args.do_CFG:
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([noisy_model_input] * 2)
+                prompt_embeds, add_conds = compute_embeddings_fn([prompt])
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                for k, v in add_conds.items():
+                    add_conds[k] = torch.cat([negative_add_conds[k], v], dim=0)
+            else:
+                latent_model_input = noisy_model_input
+                prompt_embeds, add_conds = compute_embeddings_fn([prompt])
 
             noise_pred = unet(
                 latent_model_input,
@@ -920,7 +930,7 @@ def main():
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
             loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-            accelerator.backward(loss, retain_graph=True)
+            accelerator.backward(loss)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -936,14 +946,25 @@ def main():
                 # Loss curve
                 if args.test_rabbit:
                     test_prompt_embedding, test_addtional_conditions = compute_embeddings_fn(
-                        [prompt, prompt.replace("<cls>", 'rabbit')]
+                        [prompt, prompt.replace("<cls>", 'penguins')]
                     )
-                    if args.global_emb:
-                        test_error = (test_addtional_conditions["text_embeds"][0] - test_addtional_conditions["text_embeds"][1]).pow(2).mean().sqrt()
-                    else:
-                        emb_L, emb_bigG = torch.split(test_prompt_embedding, [768, 1280], dim=-1)
-                        test_error = (emb_bigG[0][cls_idx] - emb_bigG[1][cls_idx]).pow(2).mean().sqrt()
-                    curve.append(test_error.item())
+                    if id_t == len(timesteps) - 1 and args.attn_map:
+                        cross_attn_init()
+                        unet = set_layer_with_name_and_path(unet)
+                        unet = register_cross_attention_hook(unet)
+                        _ = unet(
+                            torch.cat([noisy_model_input] * 2),
+                            t,
+                            encoder_hidden_states=test_prompt_embedding,                # [B, 77, 2048]
+                            added_cond_kwargs=test_addtional_conditions,                # {[B, 1280], [B, 6]}
+                            return_dict=False,
+                        )[0]
+                        if args.global_emb:
+                            test_error = (test_addtional_conditions["text_embeds"][0] - test_addtional_conditions["text_embeds"][1]).pow(2).mean().sqrt()
+                        else:
+                            emb_L, emb_bigG = torch.split(test_prompt_embedding, [768, 1280], dim=-1)
+                            test_error = (emb_bigG[0][cls_idx] - emb_bigG[1][cls_idx]).pow(2).mean().sqrt()
+                        curve.append(test_error.item())
                     # if id_t == 0 and args.attn_map:
                     #     attn_map = preprocess(max_height=args.resolution, max_width=args.resolution,)
                     #     visualize_and_save_attn_map(attn_map, tokenizer_2, [prompt], postfix=f"before")
@@ -957,7 +978,7 @@ def main():
             #         latents = latents.to(latents_dtype)
 
         toc = time.time()
-        # print("Time: ", toc-tic)
+        print("Time: ", toc-tic)
 
         if args.test_rabbit:
             print(curve)
